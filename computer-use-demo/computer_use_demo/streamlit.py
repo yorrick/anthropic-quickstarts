@@ -4,16 +4,16 @@ Entrypoint for streamlit, see https://docs.streamlit.io/
 
 import asyncio
 import base64
+import logging
 import os
+import pickle
 import subprocess
 import traceback
-import pickle
-import logging
 from datetime import datetime, timedelta
 from enum import StrEnum
 from functools import partial
 from pathlib import PosixPath
-from typing import cast, Dict, List, Any
+from typing import cast
 
 import httpx
 import streamlit as st
@@ -47,7 +47,7 @@ console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.DEBUG)
 
 # Create formatter and add it to handlers
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 file_handler.setFormatter(formatter)
 console_handler.setFormatter(formatter)
 
@@ -56,9 +56,9 @@ logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
 # Set higher level for other loggers to suppress their output
-logging.getLogger('watchdog').setLevel(logging.WARNING)
-logging.getLogger('asyncio').setLevel(logging.WARNING)
-logging.getLogger('streamlit').setLevel(logging.WARNING)
+logging.getLogger("watchdog").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.WARNING)
+logging.getLogger("streamlit").setLevel(logging.WARNING)
 
 # Clear any existing handlers from the root logger
 logging.getLogger().handlers.clear()
@@ -81,10 +81,12 @@ STREAMLIT_STYLE = """
 
 WARNING_TEXT = "⚠️ Security Alert: Never provide access to sensitive accounts or data, as malicious web content can hijack Claude's behavior"
 
+
 class Sender(StrEnum):
     USER = "user"
     BOT = "assistant"
     TOOL = "tool"
+
 
 class PersistentDict:
     def __init__(self, filename: str):
@@ -94,7 +96,7 @@ class PersistentDict:
     def _load(self):
         try:
             if self.filename.exists():
-                with open(self.filename, 'rb') as f:
+                with open(self.filename, "rb") as f:
                     return pickle.load(f)
         except Exception as e:
             logger.error(f"Failed to load state: {e}")
@@ -102,7 +104,7 @@ class PersistentDict:
 
     def _save(self):
         try:
-            with open(self.filename, 'wb') as f:
+            with open(self.filename, "wb") as f:
                 pickle.dump(self.cache, f)
             self.filename.chmod(0o600)
         except Exception as e:
@@ -119,17 +121,19 @@ class PersistentDict:
         self.cache.clear()
         self._save()
 
+
 # Create global state manager
-state_manager = PersistentDict('streamlit_state.pkl')
+state_manager = PersistentDict("streamlit_state.pkl")
+
 
 def setup_state():
     """Initialize and manage application state"""
     logger.debug("Setting up state")
 
     # Load persisted state
-    messages = state_manager.get('messages', [])
-    tools = state_manager.get('tools', {})
-    responses = state_manager.get('responses', {})
+    messages = state_manager.get("messages", [])
+    tools = state_manager.get("tools", {})
+    responses = state_manager.get("responses", {})
 
     logger.debug(f"Loaded persisted state with {len(messages)} messages")
 
@@ -138,14 +142,16 @@ def setup_state():
         "messages": messages,
         "api_key": load_from_storage("api_key") or os.getenv("ANTHROPIC_API_KEY", ""),
         "provider": os.getenv("API_PROVIDER", "anthropic") or APIProvider.ANTHROPIC,
-        "provider_radio": st.session_state.get("provider", os.getenv("API_PROVIDER", "anthropic") or APIProvider.ANTHROPIC),
+        "provider_radio": st.session_state.get(
+            "provider", os.getenv("API_PROVIDER", "anthropic") or APIProvider.ANTHROPIC
+        ),
         "auth_validated": False,
         "responses": responses,
         "tools": tools,
         "only_n_most_recent_images": 10,
         "custom_system_prompt": load_from_storage("system_prompt") or "",
         "hide_images": False,
-        "session_id": datetime.now().isoformat()
+        "session_id": datetime.now().isoformat(),
     }
 
     # Initialize session state with defaults
@@ -157,17 +163,21 @@ def setup_state():
     if "model" not in st.session_state:
         _reset_model()
 
+
 def update_persisted_state():
     """Update the persisted state with current session values"""
     logger.debug("Updating persisted state")
     try:
-        state_manager.set('messages', st.session_state.messages)
-        state_manager.set('tools', st.session_state.tools)
-        state_manager.set('responses', st.session_state.responses)
+        state_manager.set("messages", st.session_state.messages)
+        state_manager.set("tools", st.session_state.tools)
+        state_manager.set("responses", st.session_state.responses)
 
-        logger.debug(f"Successfully saved state with {len(st.session_state.messages)} messages")
+        logger.debug(
+            f"Successfully saved state with {len(st.session_state.messages)} messages"
+        )
     except Exception as e:
         logger.error(f"Failed to update persisted state: {e}")
+
 
 def _reset_model():
     """Reset the model based on the current provider"""
@@ -176,6 +186,7 @@ def _reset_model():
         cast(APIProvider, st.session_state.provider)
     ]
     logger.debug(f"Model set to: {st.session_state.model}")
+
 
 def validate_auth(provider: APIProvider, api_key: str | None):
     """Validate authentication credentials for the chosen provider"""
@@ -200,6 +211,7 @@ def validate_auth(provider: APIProvider, api_key: str | None):
         except DefaultCredentialsError:
             return "Your google cloud credentials are not set up correctly."
 
+
 def load_from_storage(filename: str) -> str | None:
     """Load data from a file in the storage directory."""
     try:
@@ -212,6 +224,7 @@ def load_from_storage(filename: str) -> str | None:
         logger.error(f"Error loading {filename}: {e}")
     return None
 
+
 def save_to_storage(filename: str, data: str) -> None:
     """Save data to a file in the storage directory."""
     try:
@@ -222,6 +235,7 @@ def save_to_storage(filename: str, data: str) -> None:
         file_path.chmod(0o600)
     except Exception as e:
         logger.error(f"Error saving {filename}: {e}")
+
 
 def _api_response_callback(
     request: httpx.Request,
@@ -238,6 +252,7 @@ def _api_response_callback(
     _render_api_response(request, response, response_id, tab)
     update_persisted_state()
 
+
 def _tool_output_callback(
     tool_output: ToolResult, tool_id: str, tool_state: dict[str, ToolResult]
 ):
@@ -245,6 +260,7 @@ def _tool_output_callback(
     tool_state[tool_id] = tool_output
     _render_message(Sender.TOOL, tool_output)
     update_persisted_state()
+
 
 def _render_api_response(
     request: httpx.Request,
@@ -269,6 +285,7 @@ def _render_api_response(
             else:
                 st.write(response)
 
+
 def _render_error(error: Exception):
     """Render an error message with appropriate formatting"""
     if isinstance(error, RateLimitError):
@@ -284,6 +301,7 @@ def _render_error(error: Exception):
     save_to_storage(f"error_{datetime.now().timestamp()}.md", body)
     st.error(f"**{error.__class__.__name__}**\n\n{body}", icon=":material/error:")
 
+
 def _render_message(
     sender: Sender,
     message: str | BetaContentBlockParam | ToolResult,
@@ -292,10 +310,10 @@ def _render_message(
     # streamlit's hotreloading breaks isinstance checks, so we need to check for class names
     is_tool_result = not isinstance(message, str | dict)
     if not message or (
-            is_tool_result
-            and st.session_state.hide_images
-            and not hasattr(message, "error")
-            and not hasattr(message, "output")
+        is_tool_result
+        and st.session_state.hide_images
+        and not hasattr(message, "error")
+        and not hasattr(message, "output")
     ):
         return
     with st.chat_message(sender):
@@ -321,6 +339,7 @@ def _render_message(
         else:
             st.markdown(message)
 
+
 async def main():
     """Render loop for streamlit"""
     logger.debug("Starting main loop")
@@ -336,6 +355,7 @@ async def main():
         st.warning(WARNING_TEXT)
 
     with st.sidebar:
+
         def _reset_api_provider():
             logger.debug("Resetting API provider")
             if st.session_state.provider_radio != st.session_state.provider:
@@ -373,7 +393,9 @@ async def main():
             "Custom System Prompt Suffix",
             key="custom_system_prompt",
             help="Additional instructions to append to the system prompt. see computer_use_demo/loop.py for the base system prompt.",
-            on_change=lambda: save_to_storage("system_prompt", st.session_state.custom_system_prompt),
+            on_change=lambda: save_to_storage(
+                "system_prompt", st.session_state.custom_system_prompt
+            ),
         )
         st.checkbox("Hide screenshots", key="hide_images")
 
@@ -436,7 +458,9 @@ async def main():
             )
             _render_message(Sender.USER, new_message)
             update_persisted_state()
-            logger.debug(f"Message count after append: {len(st.session_state.messages)}")
+            logger.debug(
+                f"Message count after append: {len(st.session_state.messages)}"
+            )
 
         try:
             most_recent_message = st.session_state["messages"][-1]
