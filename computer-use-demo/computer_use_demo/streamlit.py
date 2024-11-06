@@ -88,6 +88,32 @@ class Sender(StrEnum):
     TOOL = "tool"
 
 
+def clean_conversation_messages(messages):
+    """Remove any empty messages from the conversation history"""
+    return [
+        msg
+        for msg in messages
+        if msg.get("content")
+        and (
+            isinstance(msg["content"], str)
+            or (
+                isinstance(msg["content"], list)
+                and any(
+                    isinstance(block, dict)
+                    and (
+                        (block.get("type") == "text" and block.get("text"))
+                        or (
+                            block.get("type") == "tool_result"
+                            and block.get("tool_use_id")
+                        )
+                    )
+                    for block in msg["content"]
+                )
+            )
+        )
+    ]
+
+
 class PersistentDict:
     def __init__(self, filename: str):
         self.filename = CONFIG_DIR / filename
@@ -114,6 +140,9 @@ class PersistentDict:
         return self.cache.get(key, default)
 
     def set(self, key, value):
+        # Clean messages before setting if the key is 'messages'
+        if key == "messages":
+            value = clean_conversation_messages(value)
         self.cache[key] = value
         self._save()
 
@@ -129,6 +158,39 @@ class PersistentDict:
                 del self.cache[key]
         self._save()
 
+    def save_conversation_snapshot(self, snapshot_name: str):
+        """Save a snapshot of the current conversation state"""
+        # Clean messages before saving
+        messages = clean_conversation_messages(self.cache.get("messages", []))
+        conversation_state = {
+            "messages": messages,
+            "tools": self.cache.get("tools", {}),
+            "responses": self.cache.get("responses", {}),
+            "timestamp": datetime.now().isoformat(),
+        }
+        snapshots = self.cache.get("snapshots", {})
+        snapshots[snapshot_name] = conversation_state
+        self.cache["snapshots"] = snapshots
+        self._save()
+
+    def get_conversation_snapshots(self):
+        """Get all available conversation snapshots"""
+        return self.cache.get("snapshots", {})
+
+    def load_conversation_snapshot(self, snapshot_name: str):
+        """Load a specific conversation snapshot"""
+        snapshots = self.cache.get("snapshots", {})
+        if snapshot_name in snapshots:
+            snapshot = snapshots[snapshot_name]
+            # Clean messages before loading
+            messages = clean_conversation_messages(snapshot["messages"])
+            self.cache["messages"] = messages
+            self.cache["tools"] = snapshot["tools"]
+            self.cache["responses"] = snapshot["responses"]
+            self._save()
+            return True
+        return False
+
 
 # Create global state manager
 state_manager = PersistentDict("streamlit_state.pkl")
@@ -140,6 +202,8 @@ def setup_state():
 
     # Load persisted state
     messages = state_manager.get("messages", [])
+    # Clean messages during setup
+    messages = clean_conversation_messages(messages)
     tools = state_manager.get("tools", {})
     responses = state_manager.get("responses", {})
 
@@ -371,6 +435,24 @@ def _render_message(
             st.markdown(message)
 
 
+def save_conversation_snapshot():
+    """Save the current conversation state as a snapshot"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    snapshot_name = f"snapshot_{timestamp}"
+    state_manager.save_conversation_snapshot(snapshot_name)
+    return snapshot_name
+
+
+def load_conversation_snapshot(snapshot_name: str):
+    """Load a conversation snapshot and update the session state"""
+    if state_manager.load_conversation_snapshot(snapshot_name):
+        st.session_state.messages = state_manager.get("messages", [])
+        st.session_state.tools = state_manager.get("tools", {})
+        st.session_state.responses = state_manager.get("responses", {})
+        return True
+    return False
+
+
 async def main():
     """Render loop for streamlit"""
     logger.debug("Starting main loop")
@@ -430,25 +512,45 @@ async def main():
         )
         st.checkbox("Hide screenshots", key="hide_images")
 
-        # Add two columns for reset buttons
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Reset All", type="primary"):
-                logger.debug("Reset all button clicked")
-                with st.spinner("Resetting..."):
-                    state_manager.clear()
-                    st.session_state.clear()
-                    setup_state()
+        # Stack buttons vertically
+        if st.button("Reset All", type="primary", use_container_width=True):
+            logger.debug("Reset all button clicked")
+            with st.spinner("Resetting..."):
+                state_manager.clear()
+                st.session_state.clear()
+                setup_state()
 
-                    subprocess.run("pkill Xvfb; pkill tint2", shell=True)  # noqa: ASYNC221
-                    await asyncio.sleep(1)
-                    subprocess.run("./start_all.sh", shell=True)  # noqa: ASYNC221
+                subprocess.run("pkill Xvfb; pkill tint2", shell=True)  # noqa: ASYNC221
+                await asyncio.sleep(1)
+                subprocess.run("./start_all.sh", shell=True)  # noqa: ASYNC221
 
-        with col2:
-            if st.button("Reset Chat Only", type="secondary"):
-                logger.debug("Reset conversation only button clicked")
-                with st.spinner("Resetting conversation..."):
-                    reset_conversation_only()
+        if st.button("Reset Chat Only", type="secondary", use_container_width=True):
+            logger.debug("Reset conversation only button clicked")
+            with st.spinner("Resetting conversation..."):
+                reset_conversation_only()
+
+        if st.button("Save Context", type="secondary", use_container_width=True):
+            logger.debug("Save context button clicked")
+            with st.spinner("Saving conversation context..."):
+                snapshot_name = save_conversation_snapshot()
+                st.success(f"Context saved as: {snapshot_name}")
+
+        # Add a selectbox for loading saved contexts
+        snapshots = state_manager.get_conversation_snapshots()
+        if snapshots:
+            selected_snapshot = st.selectbox(
+                "Load saved context",
+                options=list(snapshots.keys()),
+                format_func=lambda x: f"{x} ({snapshots[x]['timestamp']})",
+            )
+
+            if st.button("Load Selected Context", use_container_width=True):
+                logger.debug(f"Loading context: {selected_snapshot}")
+                with st.spinner("Loading conversation context..."):
+                    if load_conversation_snapshot(selected_snapshot):
+                        st.success("Context loaded successfully!")
+                    else:
+                        st.error("Failed to load context!")
 
     if not st.session_state.auth_validated:
         if auth_error := validate_auth(
