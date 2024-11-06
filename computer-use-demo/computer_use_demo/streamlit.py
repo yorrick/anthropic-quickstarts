@@ -17,7 +17,7 @@ from typing import cast
 
 import httpx
 import streamlit as st
-from anthropic import RateLimitError
+from anthropic import Anthropic, RateLimitError
 from anthropic.types.beta import (
     BetaContentBlockParam,
     BetaTextBlockParam,
@@ -89,29 +89,193 @@ class Sender(StrEnum):
 
 
 def clean_conversation_messages(messages):
-    """Remove any empty messages from the conversation history"""
-    return [
-        msg
-        for msg in messages
-        if msg.get("content")
-        and (
-            isinstance(msg["content"], str)
-            or (
-                isinstance(msg["content"], list)
-                and any(
-                    isinstance(block, dict)
-                    and (
-                        (block.get("type") == "text" and block.get("text"))
-                        or (
-                            block.get("type") == "tool_result"
-                            and block.get("tool_use_id")
-                        )
-                    )
-                    for block in msg["content"]
-                )
-            )
+    """Remove any empty messages from the conversation history and ensure proper content format"""
+    cleaned = []
+    for msg in messages:
+        if not msg.get("content"):
+            continue
+
+        # Convert list content to string if it only contains text blocks
+        if isinstance(msg["content"], list):
+            text_content = []
+            for block in msg["content"]:
+                if isinstance(block, dict):
+                    if block.get("type") == "text" and block.get("text"):
+                        text_content.append(block["text"])
+                    elif block.get("type") == "tool_result" and block.get(
+                        "tool_use_id"
+                    ):
+                        # Keep tool results as is
+                        text_content = None
+                    break
+
+            if text_content:
+                # If we only had text blocks, join them
+                msg = {"role": msg["role"], "content": " ".join(text_content)}
+            elif not text_content and any(
+                b.get("type") == "text" and b.get("text") for b in msg["content"]
+            ):
+                # If we have text and tool results, keep original format
+                cleaned.append(msg)
+                continue
+
+        # Ensure content is not empty after processing
+        if msg.get("content"):
+            cleaned.append(msg)
+
+    return cleaned
+
+
+def format_snapshot_option(snapshot_key: str, snapshot_data: dict) -> str:
+    """Format the snapshot option for display in the selectbox"""
+    timestamp = datetime.fromisoformat(snapshot_data["timestamp"]).strftime(
+        "%m-%d %H:%M"
+    )
+
+    # Handle both old and new format snapshots
+    if "title" in snapshot_data and "summary" in snapshot_data:
+        return f"{snapshot_data['title']} ({timestamp})"
+    else:
+        return f"Snapshot from {timestamp}"
+
+
+async def generate_conversation_summary(messages: list, api_key: str) -> str:
+    """
+    Generate a summary of the conversation using Claude, with adaptive length based on content.
+    The summary length will scale between 20 and 500 words based on conversation size and complexity.
+    """
+    try:
+        client = Anthropic(api_key=api_key)
+
+        # Clean and format the messages
+        cleaned_messages = clean_conversation_messages(messages)
+        if not cleaned_messages:
+            return "Error: No valid messages to summarize"
+
+        # Format conversation and calculate complexity metrics
+        formatted_convo = ""
+        total_chars = 0
+        unique_tools = set()
+        message_count = 0
+
+        for msg in cleaned_messages:
+            message_count += 1
+            if isinstance(msg["content"], str):
+                formatted_convo += f"\n{msg['role']}: {msg['content']}"
+                total_chars += len(msg["content"])
+            elif isinstance(msg["content"], list):
+                content = []
+                for block in msg["content"]:
+                    if block.get("type") == "text":
+                        content.append(block.get("text", ""))
+                        total_chars += len(block.get("text", ""))
+                    elif block.get("type") == "tool_result":
+                        tool_id = block.get("tool_use_id", "")
+                        unique_tools.add(tool_id)
+                        content.append(f"[Tool use: {tool_id}]")
+                if content:
+                    formatted_convo += f"\n{msg['role']}: {' '.join(content)}"
+
+        # Calculate adaptive summary length
+        # Base size on multiple factors:
+        # 1. Total conversation length
+        # 2. Number of unique tools used
+        # 3. Number of messages exchanged
+        base_length = 20  # Minimum summary length
+        length_from_chars = min(
+            200, total_chars // 100
+        )  # 1 word per 100 chars, max 200
+        length_from_tools = len(unique_tools) * 30  # 30 words per unique tool
+        length_from_messages = message_count * 10  # 10 words per message
+
+        target_length = min(
+            500,
+            base_length + length_from_chars + length_from_tools + length_from_messages,
         )
-    ]
+        logger.debug(f"Calculated summary length: {target_length} words")
+
+        # Create prompt with adaptive length
+        prompt = f"""Here is a conversation between a human and an AI assistant.
+Please provide a {target_length}-word summary that captures:
+1. The main topics and goals discussed
+2. Key actions or commands executed (including specific tools used)
+3. Important outcomes or conclusions reached
+
+The summary should be detailed enough to understand the full context and flow of the conversation.
+For complex tool interactions, include brief explanations of what was accomplished.
+
+Conversation:
+{formatted_convo}
+
+{target_length}-word summary:"""
+
+        logger.debug("Making API call to generate summary")
+        response = client.messages.create(
+            model="claude-3-sonnet-20240229",
+            max_tokens=1000,  # Increased to accommodate larger summaries
+            temperature=0,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        if not response.content or not response.content[0].text:
+            logger.error("Empty response from API")
+            return "Error: Empty response from API"
+
+        summary = response.content[0].text
+        logger.debug(
+            f"Generated {len(summary.split())} word summary: {summary[:100]}..."
+        )
+        return summary
+
+    except Exception as e:
+        logger.error(f"Error generating summary: {str(e)}\n{traceback.format_exc()}")
+        return f"Error generating summary: {str(e)}"
+
+
+def extract_title_from_summary(summary: str) -> str:
+    """Extract a concise, meaningful title focusing on the main action/goal"""
+    try:
+        client = Anthropic(api_key=st.session_state.api_key)
+
+        prompt = f"""Given this conversation summary, create a very concise 4-6 word title that captures the main goal or action.
+The title should be clear and specific, focusing on what was actually done.
+
+Summary: {summary}
+
+Format your response as: TITLE: [your 4-6 word title]
+
+Examples of good titles:
+- "Set Up Virtual Desktop Environment"
+- "Configured Web Server Settings"
+- "Fixed Display Resolution Issues"
+- "Created Python Data Analysis Script"
+
+Your title should be similarly concise and specific."""
+
+        response = client.messages.create(
+            model="claude-3-sonnet-20240229",
+            max_tokens=100,
+            temperature=0,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        title = response.content[0].text
+        if "TITLE:" in title:
+            title = title.split("TITLE:")[1].strip()
+
+        # Remove any quotes or extra formatting
+        title = title.replace('"', "").replace("'", "").strip()
+
+        # Ensure it's not too long
+        words = title.split()
+        if len(words) > 6:
+            title = " ".join(words[:6])
+
+        return title
+
+    except Exception as e:
+        logger.error(f"Error generating title: {str(e)}")
+        return "Untitled conversation"
 
 
 class PersistentDict:
@@ -140,7 +304,6 @@ class PersistentDict:
         return self.cache.get(key, default)
 
     def set(self, key, value):
-        # Clean messages before setting if the key is 'messages'
         if key == "messages":
             value = clean_conversation_messages(value)
         self.cache[key] = value
@@ -150,6 +313,14 @@ class PersistentDict:
         self.cache.clear()
         self._save()
 
+    def delete_snapshot(self, snapshot_name: str):
+        """Delete a specific snapshot"""
+        if "snapshots" in self.cache and snapshot_name in self.cache["snapshots"]:
+            del self.cache["snapshots"][snapshot_name]
+            self._save()
+            return True
+        return False
+
     def clear_conversation(self):
         """Clear only conversation-related state"""
         keys_to_clear = ["messages", "tools", "responses"]
@@ -158,15 +329,17 @@ class PersistentDict:
                 del self.cache[key]
         self._save()
 
-    def save_conversation_snapshot(self, snapshot_name: str):
-        """Save a snapshot of the current conversation state"""
-        # Clean messages before saving
+    def save_conversation_snapshot(self, snapshot_name: str, summary: str):
+        """Save a snapshot of the current conversation state with summary"""
         messages = clean_conversation_messages(self.cache.get("messages", []))
+        title = extract_title_from_summary(summary)
         conversation_state = {
             "messages": messages,
             "tools": self.cache.get("tools", {}),
             "responses": self.cache.get("responses", {}),
             "timestamp": datetime.now().isoformat(),
+            "summary": summary,
+            "title": title,
         }
         snapshots = self.cache.get("snapshots", {})
         snapshots[snapshot_name] = conversation_state
@@ -176,20 +349,6 @@ class PersistentDict:
     def get_conversation_snapshots(self):
         """Get all available conversation snapshots"""
         return self.cache.get("snapshots", {})
-
-    def load_conversation_snapshot(self, snapshot_name: str):
-        """Load a specific conversation snapshot"""
-        snapshots = self.cache.get("snapshots", {})
-        if snapshot_name in snapshots:
-            snapshot = snapshots[snapshot_name]
-            # Clean messages before loading
-            messages = clean_conversation_messages(snapshot["messages"])
-            self.cache["messages"] = messages
-            self.cache["tools"] = snapshot["tools"]
-            self.cache["responses"] = snapshot["responses"]
-            self._save()
-            return True
-        return False
 
 
 # Create global state manager
@@ -202,7 +361,6 @@ def setup_state():
 
     # Load persisted state
     messages = state_manager.get("messages", [])
-    # Clean messages during setup
     messages = clean_conversation_messages(messages)
     tools = state_manager.get("tools", {})
     responses = state_manager.get("responses", {})
@@ -239,21 +397,14 @@ def setup_state():
 def reset_conversation_only():
     """Reset only the conversation state without affecting X11 or other settings"""
     logger.debug("Resetting conversation only")
-    # Clear conversation-related state
     state_manager.clear_conversation()
 
-    # Reset only conversation-related session state
     st.session_state.messages = []
     st.session_state.tools = {}
     st.session_state.responses = {}
 
-    # Keep the session ID to maintain other settings
     current_session_id = st.session_state.session_id
-
-    # Update the session state with empty conversation
     setup_state()
-
-    # Restore the session ID
     st.session_state.session_id = current_session_id
 
     logger.debug("Conversation reset complete")
@@ -326,7 +477,6 @@ def save_to_storage(filename: str, data: str) -> None:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         file_path = CONFIG_DIR / filename
         file_path.write_text(data)
-        # Ensure only user can read/write the file
         file_path.chmod(0o600)
     except Exception as e:
         logger.error(f"Error saving {filename}: {e}")
@@ -435,20 +585,66 @@ def _render_message(
             st.markdown(message)
 
 
-def save_conversation_snapshot():
-    """Save the current conversation state as a snapshot"""
+async def save_conversation_snapshot():
+    """Generate summary and save the current conversation state as a snapshot"""
+    if not st.session_state.messages:
+        st.error("No conversation to summarize")
+        return None, "No conversation to summarize"
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     snapshot_name = f"snapshot_{timestamp}"
-    state_manager.save_conversation_snapshot(snapshot_name)
-    return snapshot_name
+
+    try:
+        logger.debug("Generating conversation summary")
+        summary = await generate_conversation_summary(
+            st.session_state.messages, st.session_state.api_key
+        )
+
+        if summary.startswith("Error"):
+            st.error(summary)
+            return None, summary
+
+        logger.debug("Saving snapshot with summary")
+        state_manager.save_conversation_snapshot(snapshot_name, summary)
+        return snapshot_name, summary
+
+    except Exception as e:
+        error_msg = f"Failed to save snapshot: {str(e)}"
+        logger.error(error_msg)
+        st.error(error_msg)
+        return None, error_msg
 
 
 def load_conversation_snapshot(snapshot_name: str):
-    """Load a conversation snapshot and update the session state"""
-    if state_manager.load_conversation_snapshot(snapshot_name):
-        st.session_state.messages = state_manager.get("messages", [])
-        st.session_state.tools = state_manager.get("tools", {})
-        st.session_state.responses = state_manager.get("responses", {})
+    """Load a conversation snapshot and display its summary"""
+    snapshots = state_manager.get("snapshots", {})
+    if snapshot_name in snapshots:
+        snapshot = snapshots[snapshot_name]
+
+        # Clear existing state
+        st.session_state.tools = {}
+        st.session_state.responses = {}
+
+        timestamp = snapshot["timestamp"]
+
+        # Handle both old and new format snapshots
+        if "summary" in snapshot and not snapshot["summary"].startswith("Error"):
+            # New format with valid summary
+            st.session_state.messages = [
+                {
+                    "role": "assistant",
+                    "content": f"📝 **Conversation Summary**\n\n{snapshot['summary']}\n\n---\n*This is a summary of a previous conversation saved on {timestamp}*",
+                }
+            ]
+        else:
+            # Old format or error in summary - load the messages
+            st.session_state.messages = snapshot.get("messages", [])
+            if "summary" in snapshot:
+                st.warning(
+                    "Could not load summary, displaying original conversation instead"
+                )
+
+        state_manager._save()
         return True
     return False
 
@@ -512,7 +708,6 @@ async def main():
         )
         st.checkbox("Hide screenshots", key="hide_images")
 
-        # Stack buttons vertically
         if st.button("Reset All", type="primary", use_container_width=True):
             logger.debug("Reset all button clicked")
             with st.spinner("Resetting..."):
@@ -531,9 +726,10 @@ async def main():
 
         if st.button("Save Context", type="secondary", use_container_width=True):
             logger.debug("Save context button clicked")
-            with st.spinner("Saving conversation context..."):
-                snapshot_name = save_conversation_snapshot()
-                st.success(f"Context saved as: {snapshot_name}")
+            with st.spinner("Generating conversation summary and saving context..."):
+                snapshot_name, summary = await save_conversation_snapshot()
+                if snapshot_name:
+                    st.success(f"Context saved with summary:\n\n{summary[:100]}...")
 
         # Add a selectbox for loading saved contexts
         snapshots = state_manager.get_conversation_snapshots()
@@ -541,16 +737,16 @@ async def main():
             selected_snapshot = st.selectbox(
                 "Load saved context",
                 options=list(snapshots.keys()),
-                format_func=lambda x: f"{x} ({snapshots[x]['timestamp']})",
+                format_func=lambda x: format_snapshot_option(x, snapshots[x]),
             )
 
             if st.button("Load Selected Context", use_container_width=True):
                 logger.debug(f"Loading context: {selected_snapshot}")
-                with st.spinner("Loading conversation context..."):
+                with st.spinner("Loading conversation summary..."):
                     if load_conversation_snapshot(selected_snapshot):
-                        st.success("Context loaded successfully!")
+                        st.success("Summary loaded successfully!")
                     else:
-                        st.error("Failed to load context!")
+                        st.error("Failed to load summary!")
 
     if not st.session_state.auth_validated:
         if auth_error := validate_auth(
