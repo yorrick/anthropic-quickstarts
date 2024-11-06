@@ -121,6 +121,14 @@ class PersistentDict:
         self.cache.clear()
         self._save()
 
+    def clear_conversation(self):
+        """Clear only conversation-related state"""
+        keys_to_clear = ["messages", "tools", "responses"]
+        for key in keys_to_clear:
+            if key in self.cache:
+                del self.cache[key]
+        self._save()
+
 
 # Create global state manager
 state_manager = PersistentDict("streamlit_state.pkl")
@@ -162,6 +170,29 @@ def setup_state():
     # Ensure model is set correctly
     if "model" not in st.session_state:
         _reset_model()
+
+
+def reset_conversation_only():
+    """Reset only the conversation state without affecting X11 or other settings"""
+    logger.debug("Resetting conversation only")
+    # Clear conversation-related state
+    state_manager.clear_conversation()
+
+    # Reset only conversation-related session state
+    st.session_state.messages = []
+    st.session_state.tools = {}
+    st.session_state.responses = {}
+
+    # Keep the session ID to maintain other settings
+    current_session_id = st.session_state.session_id
+
+    # Update the session state with empty conversation
+    setup_state()
+
+    # Restore the session ID
+    st.session_state.session_id = current_session_id
+
+    logger.debug("Conversation reset complete")
 
 
 def update_persisted_state():
@@ -399,16 +430,25 @@ async def main():
         )
         st.checkbox("Hide screenshots", key="hide_images")
 
-        if st.button("Reset", type="primary"):
-            logger.debug("Reset button clicked")
-            with st.spinner("Resetting..."):
-                state_manager.clear()
-                st.session_state.clear()
-                setup_state()
+        # Add two columns for reset buttons
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Reset All", type="primary"):
+                logger.debug("Reset all button clicked")
+                with st.spinner("Resetting..."):
+                    state_manager.clear()
+                    st.session_state.clear()
+                    setup_state()
 
-                subprocess.run("pkill Xvfb; pkill tint2", shell=True)  # noqa: ASYNC221
-                await asyncio.sleep(1)
-                subprocess.run("./start_all.sh", shell=True)  # noqa: ASYNC221
+                    subprocess.run("pkill Xvfb; pkill tint2", shell=True)  # noqa: ASYNC221
+                    await asyncio.sleep(1)
+                    subprocess.run("./start_all.sh", shell=True)  # noqa: ASYNC221
+
+        with col2:
+            if st.button("Reset Chat Only", type="secondary"):
+                logger.debug("Reset conversation only button clicked")
+                with st.spinner("Resetting conversation..."):
+                    reset_conversation_only()
 
     if not st.session_state.auth_validated:
         if auth_error := validate_auth(
