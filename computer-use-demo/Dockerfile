@@ -117,4 +117,4 @@ RUN pulumi plugin install resource aws
 
 
 
-ENTRYPOINT [ "./entrypoint.sh" ]
+    ENTRYPOINT [ "./entrypoint.sh" ]
